@@ -16,6 +16,28 @@ const _timeouts = CaptureTimeouts(
 
 void main() {
   group('startup', () {
+    test('a source stopping during provider open fails immediately', () async {
+      final h = _Harness();
+      final started = h.coordinator.start(source: fakeSource());
+      final failed = expectLater(
+        started,
+        throwsA(_voiceError('source_stopped')),
+      );
+      await pumpEventQueue();
+      final session = h.connector.completeConnect();
+      await pumpEventQueue();
+      session.endFromSource();
+      await failed;
+      await pumpEventQueue();
+      expect(h.snapshot.state, CaptureState.error);
+      expect(h.snapshot.error?.retryable, isTrue);
+      expect(h.scheduler.pendingTimers, 0);
+      final late = h.provider.completeOpen();
+      await pumpEventQueue();
+      expect(late.stopCalls, 1);
+      expect(h.states, [CaptureState.starting, CaptureState.error]);
+    });
+
     test(
       'connects, opens the provider, and publishes ordered events',
       () async {
@@ -165,6 +187,25 @@ void main() {
       await started;
       await pumpEventQueue();
       expect(provider.frames.map(_seq), [3, 4]);
+      expect(h.snapshot.droppedFrames, 2);
+    });
+
+    test('backpressure drops are counted and reset per generation', () async {
+      final h = _Harness(preRoll: const PreRoll(maxBytes: 320));
+      final (session, provider) = await h.listen();
+      provider.holdFrames = true;
+      session.emitFrame(1);
+      session.emitFrame(2);
+      session.emitFrame(3);
+      expect(h.snapshot.droppedFrames, 1);
+      provider.releaseFrame();
+      await pumpEventQueue();
+      expect(provider.frames.map(_seq), [1, 3]);
+      provider.releaseFrame();
+      await pumpEventQueue();
+      await h.listen();
+      expect(h.snapshot.droppedFrames, 0);
+      await h.coordinator.stop();
     });
 
     test('a rejected frame fails the generation', () async {
@@ -247,6 +288,118 @@ void main() {
   });
 
   group('warm push-to-talk', () {
+    test('latest timeout settles older flushes only once', () async {
+      final h = _Harness(capabilities: {ProviderCapability.warmGate});
+      final utterances = <String>[];
+      h.onUtterance = utterances.add;
+      final (_, provider) = await h.listen(mode: CaptureMode.holdToTalk);
+      final first = h.coordinator.release();
+      final resumed = h.coordinator.start(
+        source: fakeSource(),
+        mode: CaptureMode.holdToTalk,
+      );
+      final second = h.coordinator.release();
+      provider.emit(const ProviderFinal('synthetic available'));
+      h.scheduler.advance(_timeouts.finalize);
+      expect(utterances, ['synthetic available']);
+      expect(h.snapshot.finalizePending, isFalse);
+      provider.completeFlush();
+      await first;
+      await resumed;
+      await pumpEventQueue();
+      provider.emit(const ProviderFinal('synthetic late'));
+      provider.completeFlush();
+      await second;
+      expect(utterances, ['synthetic available']);
+      h.scheduler.advance(_timeouts.warmHold);
+      await pumpEventQueue();
+      expect(h.snapshot.state, CaptureState.stopped);
+      expect(h.scheduler.pendingTimers, 0);
+    });
+
+    test('rapid re-hold keeps both flushes and the latest deadline', () async {
+      final h = _Harness(capabilities: {ProviderCapability.warmGate});
+      final utterances = <String>[];
+      h.onUtterance = utterances.add;
+      final (session, provider) = await h.listen(mode: CaptureMode.holdToTalk);
+      session.emitFrame(1);
+      final firstRelease = h.coordinator.release();
+      final resumed = h.coordinator.start(
+        source: fakeSource(),
+        mode: CaptureMode.holdToTalk,
+      );
+      session.emitFrame(2);
+      h.scheduler.advance(const Duration(milliseconds: 100));
+      final secondRelease = h.coordinator.release();
+      await pumpEventQueue();
+
+      provider.emit(const ProviderFinal('synthetic one'));
+      provider.completeFlush();
+      await firstRelease;
+      await resumed;
+      await pumpEventQueue();
+      expect(utterances, ['synthetic one']);
+      expect(provider.frames.map(_seq), [1, 2]);
+      expect(provider.flushPending, isTrue);
+      expect(h.snapshot.finalizePending, isTrue);
+      expect(h.scheduler.pendingTimers, 1);
+
+      // The first park's deadline must not settle the second park.
+      h.scheduler.advance(const Duration(milliseconds: 400));
+      provider.emit(const ProviderFinal('synthetic two'));
+      expect(utterances, ['synthetic one']);
+      provider.completeFlush();
+      await secondRelease;
+      expect(utterances, ['synthetic one', 'synthetic two']);
+      expect(h.snapshot.finalizePending, isFalse);
+      expect(h.scheduler.pendingTimers, 1);
+      h.scheduler.advance(_timeouts.warmHold);
+      await pumpEventQueue();
+      expect(h.snapshot.state, CaptureState.stopped);
+      expect(h.scheduler.pendingTimers, 0);
+    });
+
+    test('resume cancels the old flush deadline', () async {
+      final h = _Harness(capabilities: {ProviderCapability.warmGate});
+      final utterances = <String>[];
+      h.onUtterance = utterances.add;
+      final (_, provider) = await h.listen(mode: CaptureMode.holdToTalk);
+      final released = h.coordinator.release();
+      final resumed = h.coordinator.start(
+        source: fakeSource(),
+        mode: CaptureMode.holdToTalk,
+      );
+      expect(h.scheduler.pendingTimers, 0);
+      provider.emit(const ProviderFinal('synthetic tail'));
+      h.scheduler.advance(_timeouts.finalize);
+      expect(utterances, isEmpty);
+      expect(h.snapshot.finalizePending, isTrue);
+      provider.completeFlush();
+      await Future.wait([released, resumed]);
+      expect(utterances, ['synthetic tail']);
+      provider.emit(const ProviderFinal('synthetic resumed'));
+      h.scheduler.advance(_timeouts.finalize);
+      expect(utterances, ['synthetic tail']);
+      expect(h.snapshot.bufferedFinalText, 'synthetic resumed');
+      await h.coordinator.stop();
+    });
+
+    test('stop cancels a pending warm flush deadline', () async {
+      final h = _Harness(capabilities: {ProviderCapability.warmGate});
+      final utterances = <String>[];
+      h.onUtterance = utterances.add;
+      final (_, provider) = await h.listen(mode: CaptureMode.holdToTalk);
+      final released = h.coordinator.release();
+      provider.emit(const ProviderFinal('synthetic cancelled'));
+      await h.coordinator.stop();
+      expect(h.scheduler.pendingTimers, 0);
+      provider.completeFlush();
+      await released;
+      h.scheduler.advance(_timeouts.warmHold);
+      expect(utterances, isEmpty);
+      expect(h.scheduler.pendingTimers, 0);
+    });
+
     test('release parks warm-muted, delivers the tail, and resumes', () async {
       final h = _Harness(
         capabilities: {
@@ -364,6 +517,46 @@ void main() {
   });
 
   group('finalization', () {
+    for (final warm in [false, true]) {
+      test('a throwing ${warm ? 'gate' : 'finalize'} fails capture', () async {
+        final h = _Harness(
+          capabilities: {
+            ProviderCapability.gracefulFinalize,
+            if (warm) ProviderCapability.warmGate,
+          },
+        );
+        final utterances = <String>[];
+        h.onUtterance = utterances.add;
+        final (_, provider) = await h.listen(mode: CaptureMode.holdToTalk);
+        provider.controlFailure = StateError('synthetic control failure');
+        provider.emit(const ProviderFinal('synthetic cancelled'));
+        await h.coordinator.release();
+        await pumpEventQueue();
+        expect(h.snapshot.state, CaptureState.error);
+        expect(h.snapshot.error?.code, 'provider_control_failed');
+        expect(
+          h.kinds.where((k) => k == RuntimePayloadKind.error),
+          hasLength(1),
+        );
+        expect(utterances, isEmpty);
+        expect(h.scheduler.pendingTimers, 0);
+      });
+    }
+
+    test('control failures preserve a typed provider error', () async {
+      final h = _Harness();
+      final (_, provider) = await h.listen();
+      final failure = VoiceError(
+        code: 'synthetic_failure',
+        message: 'Synthetic provider unavailable.',
+        retryable: false,
+      );
+      provider.controlFailure = failure;
+      await h.coordinator.finalize();
+      expect(h.snapshot.error, same(failure));
+      expect(h.snapshot.state, CaptureState.error);
+    });
+
     test('concurrent finalize shares one result and one utterance', () async {
       final h = _Harness();
       final utterances = <String>[];
@@ -746,6 +939,35 @@ void main() {
   });
 
   group('stream semantics', () {
+    test('dispose closes both streams and prevents another start', () async {
+      final h = _Harness();
+      final (_, provider) = await h.listen(mode: CaptureMode.holdToTalk);
+      final eventsDone = h.coordinator.events.drain<void>();
+      final statesDone = h.coordinator.stateChanges.drain<void>();
+      final disposed = h.coordinator.dispose();
+      expect(identical(disposed, h.coordinator.dispose()), isTrue);
+      expect(() => h.coordinator.start(source: fakeSource()), throwsStateError);
+      await Future.wait([disposed, eventsDone, statesDone]);
+      expect(h.snapshot.state, CaptureState.stopped);
+      expect(provider.stopCalls, 1);
+      expect(h.scheduler.pendingTimers, 0);
+    });
+
+    test('dispose before start does not wait for paused listeners', () async {
+      final h = _Harness();
+      final done = Completer<void>();
+      final subscription = h.coordinator.events.listen(
+        (_) {},
+        onDone: done.complete,
+      )..pause();
+      await h.coordinator.dispose();
+      expect(done.isCompleted, isFalse);
+      expect(h.snapshot.state, CaptureState.idle);
+      subscription.resume();
+      await done.future;
+      expect(h.connector.connectCalls, 0);
+    });
+
     test(
       'streams have no replay and the snapshot is readable after end',
       () async {

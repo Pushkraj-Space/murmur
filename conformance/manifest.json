@@ -29,6 +29,7 @@
     { "name": "rapid-restart", "path": "fixtures/scenarios/rapid-restart.jsonl", "steps": 16, "providerCapabilities": ["gracefulFinalize"], "utterances": [] },
     { "name": "repeated-stop", "path": "fixtures/scenarios/repeated-stop.jsonl", "steps": 17, "providerCapabilities": ["gracefulFinalize"], "utterances": [] },
     { "name": "warm-mute-cycle", "path": "fixtures/scenarios/warm-mute-cycle.jsonl", "steps": 25, "providerCapabilities": ["gracefulFinalize", "warmGate", "realAudioReadiness", "amplitude"], "utterances": ["synthetic one"] },
+    { "name": "warm-rapid-rehold", "path": "fixtures/scenarios/warm-rapid-rehold.jsonl", "steps": 22, "providerCapabilities": ["warmGate"], "utterances": ["synthetic one", "synthetic two"] },
     { "name": "startup-timeout", "path": "fixtures/scenarios/startup-timeout.jsonl", "steps": 6, "providerCapabilities": ["gracefulFinalize"], "utterances": [] },
     { "name": "startup-failure", "path": "fixtures/scenarios/startup-failure.jsonl", "steps": 19, "providerCapabilities": ["gracefulFinalize"], "utterances": [] }
   ]

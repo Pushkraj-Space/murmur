@@ -80,6 +80,9 @@ final class FakeProviderSession implements ProviderSession {
   /// When set, every [addFrame] throws.
   bool rejectFrames = false;
 
+  /// When set, control calls throw without emitting a failure event.
+  Object? controlFailure;
+
   /// When set, [stop] waits for this future before completing.
   Future<void>? stopGate;
 
@@ -112,6 +115,8 @@ final class FakeProviderSession implements ProviderSession {
     bool flushAcceptedAudio = false,
   }) {
     gateCalls.add((open: open, flush: flushAcceptedAudio));
+    final failure = controlFailure;
+    if (failure != null) throw failure;
     if (open || !flushAcceptedAudio) return Future.value();
     final flush = _flush ??= Completer<void>();
     return flush.future;
@@ -128,6 +133,8 @@ final class FakeProviderSession implements ProviderSession {
   @override
   Future<FinalizationOutcome> finalize() {
     finalizeCalls++;
+    final failure = controlFailure;
+    if (failure != null) return Future.error(failure);
     final pending = _finalize ??= Completer<FinalizationOutcome>();
     return pending.future;
   }

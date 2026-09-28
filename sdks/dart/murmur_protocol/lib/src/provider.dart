@@ -115,6 +115,8 @@ abstract interface class ProviderSession {
   /// Closing with [flushAcceptedAudio] lets audio accepted before the close
   /// finish decoding; the returned future completes when that flush is done.
   /// This is distinct from [finalize], which is terminal.
+  /// Throwing fails capture; the coordinator publishes the failure even if
+  /// the provider does not also emit [ProviderFailure].
   Future<void> setInputGate({required bool open, bool flushAcceptedAudio});
 
   /// Partial, final, rejected, readiness, amplitude, failure, and closed
@@ -128,6 +130,8 @@ abstract interface class ProviderSession {
   ///
   /// Text arrives on [events]; the returned outcome is an acknowledgement only.
   /// Without [ProviderCapability.gracefulFinalize] this behaves like [stop].
+  /// Throwing fails capture and is surfaced in the coordinator's error event
+  /// and snapshot; no utterance is delivered for that failed capture.
   Future<FinalizationOutcome> finalize();
 
   /// Cancels decoding and releases resources.

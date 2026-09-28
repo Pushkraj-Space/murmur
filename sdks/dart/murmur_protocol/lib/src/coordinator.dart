@@ -134,6 +134,7 @@ final class CaptureSnapshot {
     required this.captureLive,
     required this.finalizePending,
     required this.error,
+    this.droppedFrames = 0,
   });
 
   const CaptureSnapshot.idle()
@@ -171,6 +172,9 @@ final class CaptureSnapshot {
 
   /// Whether a flush or finalization is waiting for the provider.
   final bool finalizePending;
+
+  /// Frames dropped by the pre-roll/backpressure bound in this generation.
+  final int droppedFrames;
 
   /// The failure that ended the generation, or `null`.
   final VoiceError? error;
@@ -210,6 +214,8 @@ final class VoiceCaptureCoordinator {
   final StreamController<CaptureState> _states =
       StreamController<CaptureState>.broadcast();
   _Generation? _current;
+  bool _disposed = false;
+  Future<void>? _disposeFuture;
 
   static int _sessionCounter = 0;
 
@@ -247,6 +253,7 @@ final class VoiceCaptureCoordinator {
     CaptureMode mode = CaptureMode.tapToSpeak,
     AudioFormat? requestedFormat,
   }) {
+    if (_disposed) throw StateError('The capture coordinator is disposed.');
     if (mode == CaptureMode.unspecified || mode == CaptureMode.wakePhrase) {
       throw ArgumentError.value(mode, 'mode', 'is not a coordinator policy');
     }
@@ -308,6 +315,22 @@ final class VoiceCaptureCoordinator {
     final generation = _current;
     if (generation == null) return Future.value();
     return generation.end(CaptureState.stopped);
+  }
+
+  /// Stops capture and closes the event and state streams permanently.
+  ///
+  /// Repeated calls share bounded cleanup. Paused stream consumers do not
+  /// delay disposal; they receive stream completion when they resume.
+  /// Calling [start] after disposal throws [StateError].
+  Future<void> dispose() {
+    _disposed = true;
+    return _disposeFuture ??= _dispose();
+  }
+
+  Future<void> _dispose() async {
+    await stop();
+    unawaited(_events.close());
+    unawaited(_states.close());
   }
 
   Future<void> _bounded(Future<void> future, Duration deadline) {
@@ -377,7 +400,10 @@ final class _Generation {
   Timer? _startupTimer;
   Timer? _endpointTimer;
   Timer? _finalizeTimer;
+  Timer? _warmFlushTimer;
   Timer? _warmHoldTimer;
+  int _warmPark = 0;
+  int _completedWarmPark = 0;
   Completer<void>? _startCompleter;
   Completer<FinalizationOutcome>? _finalizeCompleter;
   Future<void>? _cleanupBounded;
@@ -385,6 +411,7 @@ final class _Generation {
   int _laneFrames = 0;
   int _laneBytes = 0;
   bool _pumping = false;
+  int _droppedFrames = 0;
 
   CaptureTimeouts get _timeouts => _owner.timeouts;
   Scheduler get _scheduler => _owner._scheduler;
@@ -403,6 +430,7 @@ final class _Generation {
     captureLive: captureLive,
     finalizePending: finalizePending,
     error: error,
+    droppedFrames: _droppedFrames,
   );
 
   // Startup ---------------------------------------------------------------
@@ -492,6 +520,7 @@ final class _Generation {
       _lane.remove(oldest);
       _laneFrames--;
       _laneBytes -= oldest.bytes;
+      _droppedFrames++;
     }
     _pump();
   }
@@ -532,9 +561,17 @@ final class _Generation {
           case _ControlItem(:final run, :final done):
             try {
               await run();
-            } on Object catch (_) {
-              // A provider that fails a control call also reports the failure
-              // on its event stream; the bounded wait still completes.
+            } on Object catch (cause) {
+              _fail(
+                cause is VoiceError
+                    ? cause
+                    : VoiceError(
+                        code: 'provider_control_failed',
+                        message:
+                            'The provider could not complete capture control.',
+                        retryable: true,
+                      ),
+              );
             }
             done.complete();
         }
@@ -607,7 +644,15 @@ final class _Generation {
               ),
         );
       case SessionState.stopped:
-        if (state == CaptureState.listening ||
+        if (state == CaptureState.starting) {
+          _fail(
+            VoiceError(
+              code: 'source_stopped',
+              message: 'The source stopped before capture started.',
+              retryable: true,
+            ),
+          );
+        } else if (state == CaptureState.listening ||
             state == CaptureState.warmMuted) {
           finalizeTerminal().ignore();
         }
@@ -645,31 +690,45 @@ final class _Generation {
     partialText = '';
     finalizePending = true;
     _transition(CaptureState.warmMuted);
-    final deadline = _scheduler.schedule(_timeouts.finalize, () {
-      _completeWarmFlush();
+    final park = ++_warmPark;
+    _warmFlushTimer?.cancel();
+    _warmFlushTimer = _scheduler.schedule(_timeouts.finalize, () {
+      _completeWarmFlush(park);
     });
-    return _enqueueControl(
-      () =>
-          _providerSession!.setInputGate(open: false, flushAcceptedAudio: true),
-    ).then((_) {
-      deadline.cancel();
-      _completeWarmFlush();
+    return _enqueueControl(() async {
+      await _providerSession!.setInputGate(
+        open: false,
+        flushAcceptedAudio: true,
+      );
+      // Consume this tail before the lane reopens input for the next hold.
+      _completeWarmFlush(park);
     });
   }
 
-  void _completeWarmFlush() {
-    if (ended || state == CaptureState.finalizing || !finalizePending) return;
-    finalizePending = false;
+  void _completeWarmFlush(int park) {
+    if (ended ||
+        state == CaptureState.finalizing ||
+        park <= _completedWarmPark) {
+      return;
+    }
+    // A deadline for the latest park also settles any earlier pending tails;
+    // their late acknowledgements must not consume a later hold's text.
+    _completedWarmPark = park;
     final text = _takeUtterance();
-    if (state == CaptureState.warmMuted) {
-      _warmHoldTimer = _scheduler.schedule(_timeouts.warmHold, () {
-        end(CaptureState.stopped);
-      });
+    if (park == _warmPark) {
+      _warmFlushTimer?.cancel();
+      finalizePending = false;
+      if (state == CaptureState.warmMuted) {
+        _warmHoldTimer = _scheduler.schedule(_timeouts.warmHold, () {
+          end(CaptureState.stopped);
+        });
+      }
     }
     _deliver(text);
   }
 
   Future<void> resume() {
+    _warmFlushTimer?.cancel();
     _warmHoldTimer?.cancel();
     _gateOpen = true;
     partialText = '';
@@ -689,6 +748,7 @@ final class _Generation {
     }
     final completer = Completer<FinalizationOutcome>();
     _finalizeCompleter = completer;
+    _warmFlushTimer?.cancel();
     _warmHoldTimer?.cancel();
     _endpointTimer?.cancel();
     _gateOpen = false;
@@ -730,6 +790,7 @@ final class _Generation {
     _endpointTimer?.cancel();
     _finalizeTimer?.cancel();
     _warmHoldTimer?.cancel();
+    _warmFlushTimer?.cancel();
     _gateOpen = false;
     partialText = '';
     finalizePending = false;
