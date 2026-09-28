@@ -516,6 +516,120 @@ void main() {
     });
   });
 
+  group('utterance callback errors', () {
+    for (final warm in [true, false]) {
+      for (final timeout in [false, true]) {
+        test(
+          '${warm ? 'warm' : 'terminal'} ${timeout ? 'timeout' : 'acknowledgement'} reports app errors without failing capture',
+          () async {
+            final failure = StateError('synthetic app callback failure');
+            final stack = StackTrace.fromString('synthetic callback stack');
+            final errors = <Object>[];
+            final stacks = <StackTrace>[];
+            final utterances = <String>[];
+            late _Harness h;
+            late CaptureSnapshot afterDelivery;
+            late FakeProviderSession provider;
+            FinalizationOutcome? outcome;
+
+            await runZonedGuarded(
+              () async {
+                h = _Harness(
+                  capabilities: {
+                    ProviderCapability.gracefulFinalize,
+                    if (warm) ProviderCapability.warmGate,
+                  },
+                );
+                h.onUtterance = (text) {
+                  utterances.add(text);
+                  if (utterances.length == 1) {
+                    Error.throwWithStackTrace(failure, stack);
+                  }
+                };
+                final (session, opened) = await h.listen(
+                  mode: CaptureMode.holdToTalk,
+                );
+                provider = opened;
+                session.emitFrame(1);
+                final released = warm ? h.coordinator.release() : null;
+                final finalized = warm ? null : h.coordinator.finalize();
+                await pumpEventQueue();
+                provider.emit(const ProviderFinal('synthetic first'));
+                if (timeout) {
+                  scheduleMicrotask(
+                    () => h.scheduler.advance(_timeouts.finalize),
+                  );
+                } else if (warm) {
+                  provider.completeFlush();
+                } else {
+                  provider.completeFinalize();
+                }
+                await pumpEventQueue();
+                afterDelivery = h.snapshot;
+
+                // Late acknowledgements must not retry a throwing callback.
+                if (timeout) {
+                  if (warm) {
+                    provider.completeFlush();
+                  } else {
+                    provider.completeFinalize();
+                  }
+                }
+                if (warm) {
+                  await released;
+                  // The same generation and provider lane remain usable.
+                  if (afterDelivery.state == CaptureState.warmMuted) {
+                    await h.coordinator.start(
+                      source: fakeSource(),
+                      mode: CaptureMode.holdToTalk,
+                    );
+                    session.emitFrame(2);
+                    final second = h.coordinator.release();
+                    await pumpEventQueue();
+                    provider.emit(const ProviderFinal('synthetic second'));
+                    provider.completeFlush();
+                    await second;
+                  }
+                } else {
+                  outcome = await finalized;
+                }
+                await h.coordinator.dispose();
+                await pumpEventQueue();
+              },
+              (error, trace) {
+                errors.add(error);
+                stacks.add(trace);
+              },
+            );
+
+            expect(errors, [same(failure)]);
+            expect(stacks.single.toString(), stack.toString());
+            expect(afterDelivery.error, isNull);
+            expect(afterDelivery.finalizePending, isFalse);
+            expect(afterDelivery.bufferedFinalText, isEmpty);
+            expect(
+              afterDelivery.state,
+              warm ? CaptureState.warmMuted : CaptureState.stopped,
+            );
+            expect(h.kinds, isNot(contains(RuntimePayloadKind.error)));
+            expect(utterances, [
+              'synthetic first',
+              if (warm) 'synthetic second',
+            ]);
+            if (warm) {
+              expect(h.snapshot.sessionId, afterDelivery.sessionId);
+              expect(provider.frames.map(_seq), [1, 2]);
+            } else {
+              expect(outcome?.timedOut, timeout);
+            }
+            expect(h.snapshot.state, CaptureState.stopped);
+            expect(h.scheduler.pendingTimers, 0);
+          },
+        );
+      }
+    }
+  });
+
   group('finalization', () {
     for (final warm in [false, true]) {
       test('a throwing ${warm ? 'gate' : 'finalize'} fails capture', () async {

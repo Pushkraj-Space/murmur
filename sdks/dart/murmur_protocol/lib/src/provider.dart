@@ -135,6 +135,11 @@ abstract interface class ProviderSession {
   Future<FinalizationOutcome> finalize();
 
   /// Cancels decoding and releases resources.
+  ///
+  /// When used for terminal finalization without
+  /// [ProviderCapability.gracefulFinalize], throwing fails capture and is
+  /// surfaced in the coordinator's error event and snapshot; no utterance is
+  /// delivered. During cleanup after capture ends, errors are ignored.
   Future<void> stop();
 }
 

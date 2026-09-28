@@ -203,6 +203,10 @@ final class VoiceCaptureCoordinator {
   final VoiceProvider _provider;
 
   /// Called synchronously with each non-empty assembled utterance.
+  ///
+  /// A thrown exception is reported asynchronously as an uncaught error in
+  /// the delivery zone, with its original stack trace. It does not fail
+  /// capture or the release/finalize future, and delivery is not retried.
   final UtteranceCallback? onUtteranceFinalized;
   final CaptureTimeouts timeouts;
   final PreRoll preRoll;
@@ -857,7 +861,13 @@ final class _Generation {
 
   void _deliver(String text) {
     if (text.isEmpty) return;
-    _owner.onUtteranceFinalized?.call(text);
+    try {
+      _owner.onUtteranceFinalized?.call(text);
+    } on Object catch (cause, stack) {
+      // Report app errors outside the provider lane and finalization futures,
+      // so provider failure handling cannot misclassify or swallow them.
+      scheduleMicrotask(() => Error.throwWithStackTrace(cause, stack));
+    }
   }
 
   void _setCaptureLive(bool live) {
