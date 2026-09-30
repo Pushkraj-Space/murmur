@@ -1,0 +1,60 @@
+name: Connector proposal
+description: Propose a new voice source connector before implementing it.
+title: "[Connector] "
+labels: ["area: connectors"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Read the [connector authoring guide](https://github.com/october-dev/murmur/blob/main/docs/connector-authoring.md) first. A proposal lets maintainers agree on scope and ownership before implementation starts.
+  - type: textarea
+    id: source
+    attributes:
+      label: Source and platforms
+      description: The device or source family, and the platforms you intend to support (Android, iOS, macOS, Linux, Windows, server).
+    validations:
+      required: true
+  - type: input
+    id: language
+    attributes:
+      label: Implementation language and SDK
+      description: For example Dart with murmur_protocol, or TypeScript with @october-dev/murmur-protocol. Say whether it runs in-process, behind FFI, or as a sidecar.
+    validations:
+      required: true
+  - type: textarea
+    id: protocol-sources
+    attributes:
+      label: Protocol sources and licenses
+      description: Where the transport, packet, and codec details come from (official documentation, an open-source implementation, your own hardware observation), with each source's license.
+    validations:
+      required: true
+  - type: textarea
+    id: capabilities
+    attributes:
+      label: Capabilities and audio format
+      description: Which SourceCapability values you expect to support, plus the codec, sample rate, channels, and framing.
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware access and validation
+      description: Which physical devices and platforms you can test on, and what cannot be tested.
+    validations:
+      required: true
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy implications
+      description: Permissions required, identifiers the source exposes, background or always-on capture, and anything recorded or stored on the device.
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Confirmations
+      options:
+        - label: The connector will ship a connector.json manifest with an honest status.
+          required: true
+        - label: Tests will use synthetic audio and fakes; no recordings, transcripts, or device identifiers will be committed.
+          required: true

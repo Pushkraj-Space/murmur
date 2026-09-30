@@ -417,7 +417,8 @@ Contributions are especially useful around:
 - remote-agent permissions, commands, and auditing
 - privacy, consent, accessibility, and data-retention design
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. To add a
+voice source, start with the [connector authoring guide](docs/connector-authoring.md).
 
 ## License
 

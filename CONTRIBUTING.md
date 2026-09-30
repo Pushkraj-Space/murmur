@@ -75,6 +75,11 @@ out in the pull request.
 
 ## Connector pull requests
 
+Read the [connector authoring guide](docs/connector-authoring.md) and open a
+connector proposal issue before starting a new connector family. The guide
+explains the expected lifecycle, error, backpressure, and cleanup behavior and
+points to a tested example connector.
+
 A connector contribution should document:
 
 1. the device or source and supported platforms
