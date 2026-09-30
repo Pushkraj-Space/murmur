@@ -1,8 +1,12 @@
 import 'dart:async';
-import 'dart:collection';
+import 'dart:convert';
+import 'dart:io';
 
 import 'package:murmur_protocol/murmur_protocol.dart';
+import 'package:murmur_protocol/testing.dart';
 import 'package:test/test.dart';
+
+import '../example/fake_voice_connector.dart' as example;
 
 void main() {
   group('typed wire models', () {
@@ -189,61 +193,111 @@ void main() {
     });
   });
 
-  group('runtime interfaces', () {
-    test('discovers until cancellation and connects an idle session', () async {
-      final connector = _FakeConnector();
-      final discovered = Completer<VoiceSource>();
-      final subscription = connector.discoverSources().listen(
-        discovered.complete,
+  group('fake voice connector', () {
+    test('discovers configured sources in order', () async {
+      expect(FakeVoiceConnector().sources.single.toJson(), {
+        'sourceId': 'fake-source-1',
+        'displayName': 'Synthetic microphone',
+        'transport': 'SOURCE_TRANSPORT_SYNTHETIC',
+        'capabilities': ['SOURCE_CAPABILITY_LIVE_AUDIO'],
+      });
+
+      final sources = [_source('a'), _source('b'), _source('c')];
+      final connector = FakeVoiceConnector(sources: sources);
+      expect(await connector.discoverSources().take(3).toList(), sources);
+
+      for (final configured in [<VoiceSource>[], sources]) {
+        final received = <VoiceSource>[];
+        var done = false;
+        final subscription = FakeVoiceConnector(
+          sources: configured,
+        ).discoverSources().listen(received.add, onDone: () => done = true);
+        await pumpEventQueue();
+        expect(received, configured);
+        expect(done, isFalse, reason: 'discovery runs until cancelled');
+        await subscription.cancel();
+      }
+
+      expect(
+        () => FakeVoiceConnector(sources: [_source('a'), _source('a')]),
+        throwsArgumentError,
       );
+    });
 
-      expect(await discovered.future, same(connector.source));
-      await subscription.cancel();
-      expect(connector.scanStops, 1);
+    test('cancelling discovery stops later sources', () async {
+      final sources = [_source('a'), _source('b'), _source('c')];
+      final received = <VoiceSource>[];
+      late final StreamSubscription<VoiceSource> subscription;
+      subscription = FakeVoiceConnector(sources: sources)
+          .discoverSources()
+          .listen((source) {
+            received.add(source);
+            unawaited(subscription.cancel());
+          });
 
-      final session = await connector.connect(connector.source) as _FakeSession;
+      await pumpEventQueue();
+      expect(received, [sources.first]);
+    });
+
+    test('connect failures are configurable and typed', () async {
+      final failure = VoiceError(
+        code: 'connect_failed',
+        message: 'The synthetic source did not connect.',
+        retryable: true,
+      );
+      final connector = FakeVoiceConnector(connectError: failure);
+      final source = connector.sources.single;
+
+      await expectLater(connector.connect(source), throwsA(same(failure)));
+      await expectLater(connector.connect(source), throwsA(same(failure)));
+
+      connector.connectError = null;
+      final first = await connector.connect(source);
+      expect(first.sessionId, 'fake-session-1');
+      expect(first.source, same(source));
+
+      final sameId = VoiceSource(
+        id: source.id,
+        displayName: 'Another name',
+        transport: VoiceSourceTransport.network,
+      );
+      final second = await connector.connect(sameId);
+      expect(second.sessionId, 'fake-session-2');
+      expect(second.source, same(source));
+
+      await expectLater(
+        connector.connect(_source('missing')),
+        throwsA(
+          isA<VoiceError>()
+              .having((error) => error.code, 'code', 'source_not_found')
+              .having((error) => error.retryable, 'retryable', false),
+        ),
+      );
+    });
+
+    test('stop is terminal and keeps snapshots readable', () async {
+      final session = await _connect();
       expect(session.state, SessionState.idle);
       expect(session.format, isNull);
       expect(session.error, isNull);
 
-      final received = <AudioFrame>[];
-      final framesSubscription = session.frames.listen(received.add);
-      expect(session.emitFrame(1), isFalse);
-      expect(received, isEmpty);
-
-      await session.start();
-      expect(session.state, SessionState.listening);
-      expect(session.format, same(_defaultFormat));
-      expect(session.emitFrame(2), isTrue);
-      expect(received.single.sequence, BigInt.two);
-
-      await session.close();
-      await framesSubscription.cancel();
-    });
-
-    test('connect failure releases partial acquisition', () async {
-      final connector = _FakeConnector(failConnect: true);
-
-      await expectLater(
-        connector.connect(connector.source),
-        throwsA(
-          isA<VoiceError>()
-              .having((error) => error.code, 'code', 'connect_failed')
-              .having((error) => error.retryable, 'retryable', true),
-        ),
-      );
-      expect(connector.partialAcquisitions, 1);
-      expect(connector.partialReleases, 1);
-    });
-
-    test('stop is terminal and keeps snapshots readable', () async {
-      final session = _FakeSession(source: _source(), sessionId: 'session-1');
       final states = <SessionState>[];
       final stateSubscription = session.stateChanges.listen(states.add);
       final framesDone = session.frames.drain<void>();
 
-      await session.start(requestedFormat: _format());
+      await session.start(
+        requestedFormat: AudioFormat(
+          sampleRateHz: 48000,
+          channels: 2,
+          encoding: AudioEncoding.pcmF32le,
+        ),
+      );
+      expect(session.state, SessionState.listening);
+      expect(session.format, same(syntheticAudioFormat));
+
       await session.stop(reason: 'test complete');
+      await framesDone;
+      await pumpEventQueue();
 
       expect(states, [
         SessionState.starting,
@@ -251,11 +305,10 @@ void main() {
         SessionState.stopped,
       ]);
       expect(session.state, SessionState.stopped);
-      expect(session.source.id, 'source-1');
-      expect(session.sessionId, 'session-1');
-      expect(session.format?.frameDurationMs, 10);
+      expect(session.sessionId, 'fake-session-1');
+      expect(session.source.id, 'fake-source-1');
+      expect(session.format, same(syntheticAudioFormat));
       expect(session.error, isNull);
-      await framesDone;
       expect(() => session.start(), throwsStateError);
       await stateSubscription.cancel();
     });
@@ -263,36 +316,58 @@ void main() {
     test(
       'state changes have no replay and support subscribe-then-read',
       () async {
-        final session = _FakeSession(source: _source(), sessionId: 'session-1');
+        final session = await _connect();
         await session.start();
+        await pumpEventQueue();
 
         final states = <SessionState>[];
         final subscription = session.stateChanges.listen(states.add);
-        final snapshot = session.state;
-        expect(snapshot, SessionState.listening);
+        expect(session.state, SessionState.listening);
+        await pumpEventQueue();
         expect(states, isEmpty);
 
         await session.close();
+        await pumpEventQueue();
         expect(states, [SessionState.stopped]);
         await subscription.cancel();
       },
     );
 
+    test('completeStart requires a pending manual start', () async {
+      final automatic = await _connect();
+      expect(automatic.completeStart, throwsStateError);
+      final pending = automatic.start();
+      expect(automatic.completeStart, throwsStateError);
+      await pending;
+
+      final manual = await _connect(autoCompleteStart: false);
+      expect(manual.completeStart, throwsStateError);
+      final start = manual.start();
+      await pumpEventQueue();
+      expect(manual.state, SessionState.starting);
+      manual.completeStart();
+      await start;
+      expect(manual.state, SessionState.listening);
+      expect(manual.completeStart, throwsStateError);
+
+      await manual.close();
+      manual.completeStart();
+      expect(manual.state, SessionState.stopped);
+      await automatic.close();
+    });
+
     for (final terminator in ['close', 'stop']) {
       test(
         '$terminator wins against a pending start without resurrection',
         () async {
-          final acquisitionGate = Completer<_FakeAcquisition>();
-          final session = _FakeSession(
-            source: _source(),
-            sessionId: 'session-race',
-            acquisitionGate: acquisitionGate,
-          );
+          final session = await _connect(autoCompleteStart: false);
           final states = <SessionState>[];
           final stateSubscription = session.stateChanges.listen(states.add);
-          final startFuture = session.start();
+          final frames = <AudioFrame>[];
+          final framesSubscription = session.frames.listen(frames.add);
+
           final cancelled = expectLater(
-            startFuture,
+            session.start(),
             throwsA(
               isA<VoiceError>().having(
                 (error) => error.code,
@@ -301,68 +376,72 @@ void main() {
               ),
             ),
           );
+          await pumpEventQueue();
+          expect(session.state, SessionState.starting);
 
-          final cleanup = terminator == 'close'
+          await (terminator == 'close'
               ? session.close()
-              : session.stop(reason: 'cancel startup');
-          await cleanup;
+              : session.stop(reason: 'cancel startup'));
           await cancelled;
-          expect(session.state, SessionState.stopped);
-          expect(session.cleanupRuns, 1);
 
-          final lateAcquisition = _FakeAcquisition();
-          acquisitionGate.complete(lateAcquisition);
-          await lateAcquisition.released;
+          session.completeStart();
+          await pumpEventQueue();
 
-          expect(lateAcquisition.releaseCalls, 1);
           expect(session.state, SessionState.stopped);
           expect(session.format, isNull);
-          expect(session.emitFrame(1), isFalse);
+          expect(frames, isEmpty);
           expect(states, [SessionState.starting, SessionState.stopped]);
           await stateSubscription.cancel();
+          await framesSubscription.cancel();
         },
       );
     }
 
-    test('concurrent stop and close share one pending cleanup', () async {
-      final releaseGate = Completer<void>();
-      final acquisition = _FakeAcquisition(releaseGate: releaseGate);
-      final session = _FakeSession(
-        source: _source(),
-        sessionId: 'session-1',
-        acquisitionGate: Completer<_FakeAcquisition>()..complete(acquisition),
+    test('stop wins against a scheduled automatic start', () async {
+      final session = await _connect();
+      final states = <SessionState>[];
+      final stateSubscription = session.stateChanges.listen(states.add);
+      final frames = session.frames.toList();
+
+      final cancelled = expectLater(
+        session.start(),
+        throwsA(
+          isA<VoiceError>().having((error) => error.code, 'code', 'cancelled'),
+        ),
       );
-      await session.start();
+      await session.stop();
+      await cancelled;
+      await pumpEventQueue();
 
-      final first = session.close();
-      final second = session.stop();
-      final third = session.close();
-      expect(identical(first, second), isTrue);
-      expect(identical(second, third), isTrue);
-
-      var completed = false;
-      unawaited(first.then((_) => completed = true));
-      await Future<void>.delayed(Duration.zero);
-      expect(completed, isFalse);
-      expect(session.cleanupRuns, 1);
-      expect(acquisition.releaseCalls, 1);
-
-      releaseGate.complete();
-      await Future.wait([first, second, third]);
-      expect(completed, isTrue);
-      expect(acquisition.releaseCalls, 1);
+      expect(states, [SessionState.starting, SessionState.stopped]);
+      expect(session.state, SessionState.stopped);
+      expect(session.format, isNull);
+      expect(await frames, isEmpty);
+      await stateSubscription.cancel();
     });
 
-    test('device failure publishes its cause before terminal state', () async {
-      final acquisition = _FakeAcquisition();
-      final session = _FakeSession(
-        source: _source(),
-        sessionId: 'session-1',
-        acquisitionGate: Completer<_FakeAcquisition>()..complete(acquisition),
-      );
+    test('failure during a pending start fails the start', () async {
+      final session = await _connect(autoCompleteStart: false);
       final failure = VoiceError(
-        code: 'device_lost',
-        message: 'The source disconnected.',
+        code: 'start_failed',
+        message: 'The synthetic source did not start.',
+        retryable: false,
+      );
+      final failed = expectLater(session.start(), throwsA(same(failure)));
+
+      await session.fail(failure);
+      await failed;
+
+      expect(session.state, SessionState.error);
+      expect(session.error, same(failure));
+      expect(session.format, isNull);
+    });
+
+    test('disconnect publishes its cause before the error state', () async {
+      final session = await _connect();
+      final disconnected = VoiceError(
+        code: 'disconnected',
+        message: 'The synthetic source disconnected.',
         retryable: true,
         metadata: {'transport': 'synthetic'},
       );
@@ -370,35 +449,109 @@ void main() {
       final stateSubscription = session.stateChanges.listen((state) {
         if (state == SessionState.error) observedErrors.add(session.error);
       });
-      final framesDone = session.frames.drain<void>();
+      final frames = session.frames.toList();
       await session.start();
 
-      await session.failDevice(failure);
+      await session.fail(disconnected);
+      expect(await frames, hasLength(2));
+      await pumpEventQueue();
 
+      expect(observedErrors, [same(disconnected)]);
+      await session.stop();
+      await session.fail(
+        VoiceError(code: 'late', message: 'Too late.', retryable: false),
+      );
       expect(session.state, SessionState.error);
-      expect(session.error, same(failure));
-      expect(observedErrors, [same(failure)]);
-      expect(acquisition.releaseCalls, 1);
-      await framesDone;
+      expect(session.error, same(disconnected));
       expect(() => session.start(), throwsStateError);
       await stateSubscription.cancel();
     });
 
+    test('repeated and concurrent terminators share one cleanup', () async {
+      final session = await _connect();
+      final states = <SessionState>[];
+      final stateSubscription = session.stateChanges.listen(states.add);
+      await session.start();
+
+      final cleanups = [
+        session.close(),
+        session.stop(),
+        session.close(),
+        session.fail(
+          VoiceError(code: 'late', message: 'Too late.', retryable: false),
+        ),
+      ];
+      for (final cleanup in cleanups) {
+        expect(cleanup, same(cleanups.first));
+      }
+      await Future.wait(cleanups);
+      await session.close();
+      await pumpEventQueue();
+
+      expect(states, [
+        SessionState.starting,
+        SessionState.listening,
+        SessionState.stopped,
+      ]);
+      expect(session.error, isNull);
+      await stateSubscription.cancel();
+    });
+
+    test('listeners may terminate the session from callbacks', () async {
+      final session = await _connect();
+      final first = <SessionState>[];
+      final second = <SessionState>[];
+      Future<void>? stopped;
+      final firstSubscription = session.stateChanges.listen((state) {
+        first.add(state);
+        if (state == SessionState.listening) stopped = session.stop();
+      });
+      final secondSubscription = session.stateChanges.listen(second.add);
+
+      await session.start();
+      await pumpEventQueue();
+      await stopped;
+
+      const expected = [
+        SessionState.starting,
+        SessionState.listening,
+        SessionState.stopped,
+      ];
+      expect(first, expected);
+      expect(second, expected);
+
+      final other = await _connect();
+      final received = <AudioFrame>[];
+      final framesDone = Completer<void>();
+      other.frames.listen((frame) {
+        received.add(frame);
+        unawaited(other.close());
+      }, onDone: framesDone.complete);
+      await other.start();
+      await framesDone.future;
+      expect(received, hasLength(2));
+      expect(other.state, SessionState.stopped);
+
+      await firstSubscription.cancel();
+      await secondSubscription.cancel();
+    });
+
     test('cleanup does not wait for never-listened streams', () async {
-      final session = _FakeSession(source: _source(), sessionId: 'session-1');
+      final session = await _connect();
+      await session.start();
 
       await session.close().timeout(const Duration(seconds: 1));
 
       expect(session.state, SessionState.stopped);
-      expect(session.cleanupRuns, 1);
     });
 
     test('cleanup does not wait for paused stream consumers', () async {
-      final session = _FakeSession(source: _source(), sessionId: 'session-1');
+      final session = await _connect();
       final frameSubscription = session.frames.listen((_) {});
       final stateSubscription = session.stateChanges.listen((_) {});
       frameSubscription.pause();
       stateSubscription.pause();
+      await session.start();
 
       await session.close().timeout(const Duration(seconds: 1));
 
@@ -407,42 +560,63 @@ void main() {
       await stateSubscription.cancel();
     });
 
-    test(
-      'paused frame delivery is bounded and drops the oldest frame',
-      () async {
-        final session = _FakeSession(source: _source(), sessionId: 'session-1');
-        final received = <BigInt>[];
-        final subscription = session.frames.listen(
-          (frame) => received.add(frame.sequence),
-        );
-        await session.start();
+    test('produces the canonical synthetic clip', () async {
+      final fixture = File('../../../conformance/fixtures/audio-frames.jsonl')
+          .readAsLinesSync()
+          .where((line) => line.trim().isNotEmpty)
+          .take(2)
+          .map((line) => requireObject(jsonDecode(line), 'audio frame'))
+          .toList();
+      final session = await _connect();
+      final clip = session.frames.take(2).toList();
 
-        expect(session.emitFrame(1), isTrue);
-        subscription.pause();
-        expect(session.emitFrame(2), isTrue);
-        expect(session.emitFrame(3), isTrue);
-        expect(session.emitFrame(4), isTrue);
-        expect(session.bufferedFrames, 2);
-        expect(session.droppedFrames, 1);
+      await session.start();
+      final frames = await clip;
 
-        subscription.resume();
-        await Future<void>.delayed(Duration.zero);
-        expect(received, [BigInt.one, BigInt.from(3), BigInt.from(4)]);
-        expect(session.bufferedFrames, 0);
+      for (var index = 0; index < 2; index++) {
+        expect(frames[index].toJson(), {
+          ...fixture[index],
+          'sessionId': session.sessionId,
+        });
+        expect(base64Decode(frames[index].payloadBase64), hasLength(320));
+      }
+      await session.close();
+    });
 
-        await session.close();
-        expect(session.emitFrame(5), isFalse);
-        await subscription.cancel();
-      },
-    );
+    test('connecting never captures and late consumers get the clip', () async {
+      final idle = await _connect();
+      final early = <AudioFrame>[];
+      final earlySubscription = idle.frames.listen(early.add);
+      await pumpEventQueue();
+      expect(early, isEmpty);
+      await idle.close();
+      await earlySubscription.cancel();
+
+      final session = await _connect();
+      await session.start();
+      await pumpEventQueue();
+      final received = <AudioFrame>[];
+      final subscription = session.frames.listen(received.add);
+      await pumpEventQueue();
+
+      expect(received.map((frame) => frame.sequence), [BigInt.one, BigInt.two]);
+      expect(session.state, SessionState.listening);
+      await session.close();
+      await subscription.cancel();
+    });
+
+    test('example host code consumes the fake connector', () async {
+      final clip = await example.captureSyntheticClip(FakeVoiceConnector());
+
+      expect(clip.map((frame) => frame.sequence), [BigInt.one, BigInt.two]);
+    });
   });
 }
 
-final _defaultFormat = AudioFormat(
-  sampleRateHz: 16000,
-  channels: 1,
-  encoding: AudioEncoding.pcmS16le,
-);
+Future<FakeVoiceSession> _connect({bool autoCompleteStart = true}) {
+  final connector = FakeVoiceConnector(autoCompleteStart: autoCompleteStart);
+  return connector.connect(connector.sources.single);
+}
 
 AudioFormat _format() => AudioFormat(
   sampleRateHz: 16000,
@@ -451,8 +625,8 @@ AudioFormat _format() => AudioFormat(
   frameDurationMs: 10,
 );
 
-VoiceSource _source() => VoiceSource(
-  id: 'source-1',
+VoiceSource _source([String id = 'source-1']) => VoiceSource(
+  id: id,
   displayName: 'Synthetic microphone',
   transport: VoiceSourceTransport.synthetic,
   capabilities: {VoiceSourceCapability.liveAudio},
@@ -467,307 +641,3 @@ Map<String, Object?> _controlJson(
   'requestSequence': '1',
   commandField: body,
 };
-
-final class _FakeConnector implements VoiceConnector {
-  _FakeConnector({this.failConnect = false}) : source = _source();
-
-  final bool failConnect;
-  final VoiceSource source;
-  int scanStops = 0;
-  int partialAcquisitions = 0;
-  int partialReleases = 0;
-  int _nextSession = 0;
-
-  @override
-  Stream<VoiceSource> discoverSources() {
-    late final StreamController<VoiceSource> controller;
-    controller = StreamController<VoiceSource>(
-      sync: true,
-      onListen: () {
-        scheduleMicrotask(() {
-          if (!controller.isClosed && controller.hasListener) {
-            controller.add(source);
-          }
-        });
-      },
-      onCancel: () {
-        scanStops++;
-      },
-    );
-    return controller.stream;
-  }
-
-  @override
-  Future<VoiceSession> connect(VoiceSource source) async {
-    if (failConnect) {
-      partialAcquisitions++;
-      try {
-        throw VoiceError(
-          code: 'connect_failed',
-          message: 'The synthetic source did not connect.',
-          retryable: true,
-        );
-      } finally {
-        partialReleases++;
-      }
-    }
-    return _FakeSession(
-      source: source,
-      sessionId: 'fake-session-${++_nextSession}',
-    );
-  }
-}
-
-final class _FakeSession implements VoiceSession {
-  _FakeSession({
-    required this.source,
-    required this.sessionId,
-    Completer<_FakeAcquisition>? acquisitionGate,
-    Completer<void>? cleanupGate,
-  }) : _acquisitionGate = acquisitionGate,
-       _cleanupGate = cleanupGate {
-    _frameController = StreamController<AudioFrame>(
-      sync: true,
-      onListen: () {
-        _frameConsumerReady = true;
-        _flushFrames();
-      },
-      onPause: () {
-        _frameConsumerReady = false;
-      },
-      onResume: () {
-        _frameConsumerReady = true;
-        _flushFrames();
-      },
-      onCancel: () {
-        _frameConsumerReady = false;
-        _pendingFrames.clear();
-      },
-    );
-  }
-
-  // This fake buffers at most two undelivered frames and drops the oldest.
-  static const _frameCapacity = 2;
-
-  @override
-  final VoiceSource source;
-
-  @override
-  final String sessionId;
-
-  final Completer<_FakeAcquisition>? _acquisitionGate;
-  final Completer<void>? _cleanupGate;
-  final Queue<AudioFrame> _pendingFrames = Queue<AudioFrame>();
-  final StreamController<SessionState> _stateController =
-      StreamController<SessionState>.broadcast(sync: true);
-  late final StreamController<AudioFrame> _frameController;
-
-  SessionState _state = SessionState.idle;
-  AudioFormat? _format;
-  VoiceError? _error;
-  _FakeAcquisition? _activeAcquisition;
-  Completer<void>? _pendingStart;
-  Future<void>? _cleanupFuture;
-  var _generation = 0;
-  var _terminal = false;
-  var _frameConsumerReady = false;
-  var _frameControllerClosed = false;
-  var cleanupRuns = 0;
-  var droppedFrames = 0;
-
-  int get bufferedFrames => _pendingFrames.length;
-
-  @override
-  AudioFormat? get format => _format;
-
-  @override
-  SessionState get state => _state;
-
-  @override
-  Stream<SessionState> get stateChanges => _stateController.stream;
-
-  @override
-  VoiceError? get error => _error;
-
-  @override
-  Stream<AudioFrame> get frames => _frameController.stream;
-
-  @override
-  Future<void> start({AudioFormat? requestedFormat}) {
-    if (_state != SessionState.idle || _terminal) {
-      throw StateError('capture can only start from an idle session');
-    }
-    final operation = Completer<void>();
-    _pendingStart = operation;
-    final generation = ++_generation;
-    _transition(SessionState.starting);
-    unawaited(_finishStart(generation, operation, requestedFormat));
-    return operation.future;
-  }
-
-  Future<void> _finishStart(
-    int generation,
-    Completer<void> operation,
-    AudioFormat? requestedFormat,
-  ) async {
-    try {
-      final gate = _acquisitionGate;
-      final acquisition = gate == null ? _FakeAcquisition() : await gate.future;
-      if (_terminal || generation != _generation) {
-        await acquisition.release();
-        return;
-      }
-      _activeAcquisition = acquisition;
-      _format = requestedFormat ?? _defaultFormat;
-      _pendingStart = null;
-      _transition(SessionState.listening);
-      operation.complete();
-    } on Object catch (cause, stackTrace) {
-      if (_terminal || generation != _generation) return;
-      final failure = cause is VoiceError
-          ? cause
-          : VoiceError(
-              code: 'start_failed',
-              message: cause.toString(),
-              retryable: false,
-            );
-      unawaited(
-        _terminate(
-          terminalState: SessionState.error,
-          startFailure: failure,
-          stackTrace: stackTrace,
-        ),
-      );
-    }
-  }
-
-  @override
-  Future<void> stop({String? reason}) {
-    return _terminate(
-      terminalState: SessionState.stopped,
-      startFailure: VoiceError(
-        code: 'cancelled',
-        message: 'Session start was cancelled.',
-        retryable: true,
-      ),
-    );
-  }
-
-  @override
-  Future<void> close() => stop();
-
-  Future<void> failDevice(VoiceError failure) {
-    return _terminate(terminalState: SessionState.error, startFailure: failure);
-  }
-
-  Future<void> _terminate({
-    required SessionState terminalState,
-    required VoiceError startFailure,
-    StackTrace? stackTrace,
-  }) {
-    final existing = _cleanupFuture;
-    if (existing != null) return existing;
-
-    final cleanup = Completer<void>();
-    final future = cleanup.future;
-    _cleanupFuture = future;
-    _terminal = true;
-    _generation++;
-
-    final pendingStart = _pendingStart;
-    _pendingStart = null;
-    if (pendingStart != null && !pendingStart.isCompleted) {
-      pendingStart.completeError(startFailure, stackTrace);
-    }
-    if (terminalState == SessionState.error) {
-      _error = startFailure;
-    }
-    _transition(terminalState);
-
-    _pendingFrames.clear();
-    _frameControllerClosed = true;
-    unawaited(_frameController.close());
-    unawaited(_stateController.close());
-    unawaited(_finishCleanup(cleanup));
-    return future;
-  }
-
-  Future<void> _finishCleanup(Completer<void> cleanup) async {
-    cleanupRuns++;
-    try {
-      final acquisition = _activeAcquisition;
-      _activeAcquisition = null;
-      if (acquisition != null) {
-        await acquisition.release();
-      }
-      final gate = _cleanupGate;
-      if (gate != null) await gate.future;
-      cleanup.complete();
-    } on Object catch (error, stackTrace) {
-      cleanup.completeError(error, stackTrace);
-    }
-  }
-
-  bool emitFrame(int sequence) {
-    if (_terminal || _state != SessionState.listening) return false;
-    final frame = AudioFrame(
-      protocol: ProtocolVersion.current,
-      sessionId: sessionId,
-      sequence: BigInt.from(sequence),
-      monotonicTimeUs: BigInt.from(sequence * 10000),
-      format: _format ?? _defaultFormat,
-      payloadBase64: 'AA==',
-    );
-    if (_frameConsumerReady && _pendingFrames.isEmpty) {
-      _frameController.add(frame);
-    } else {
-      if (_pendingFrames.length == _frameCapacity) {
-        _pendingFrames.removeFirst();
-        droppedFrames++;
-      }
-      _pendingFrames.addLast(frame);
-    }
-    return true;
-  }
-
-  void _flushFrames() {
-    while (_frameConsumerReady &&
-        !_frameControllerClosed &&
-        _pendingFrames.isNotEmpty) {
-      _frameController.add(_pendingFrames.removeFirst());
-    }
-  }
-
-  void _transition(SessionState next) {
-    _state = next;
-    if (!_stateController.isClosed) {
-      _stateController.add(next);
-    }
-  }
-}
-
-final class _FakeAcquisition {
-  _FakeAcquisition({Completer<void>? releaseGate}) : _releaseGate = releaseGate;
-
-  final Completer<void>? _releaseGate;
-  final Completer<void> _released = Completer<void>();
-  Future<void>? _releaseFuture;
-  var releaseCalls = 0;
-
-  Future<void> get released => _released.future;
-
-  Future<void> release() {
-    final existing = _releaseFuture;
-    if (existing != null) return existing;
-    releaseCalls++;
-    final future = _release();
-    _releaseFuture = future;
-    return future;
-  }
-
-  Future<void> _release() async {
-    final gate = _releaseGate;
-    if (gate != null) await gate.future;
-    if (!_released.isCompleted) _released.complete();
-  }
-}

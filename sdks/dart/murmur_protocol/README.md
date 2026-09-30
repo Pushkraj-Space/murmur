@@ -19,4 +19,26 @@ The package source and pub.dev metadata are in place. It remains unpublished
 while the initial public protocol is reviewed against the shared fixtures in
 `conformance/`.
 
+## Deterministic fake connector
+
+`package:murmur_protocol/testing.dart` provides `FakeVoiceConnector` and
+`FakeVoiceSession` so hosts, providers, and apps can be developed and tested
+without hardware. Discovery emits the configured sources in order, and
+sessions follow `idle → starting → listening → stopped | error` without timers
+or randomness.
+
+On entering `listening`, each session produces the two synthetic frames from
+`conformance/README.md`: 16 kHz mono `pcmS16le` in 10 ms frames, a 1 kHz sine
+at sequence 1 and silence at sequence 2. `monotonicTimeUs` is 10000 and 20000
+on a clock that is 0 when capture starts. Frames are buffered for a late or
+paused consumer, never more than those two.
+
+Tests drive the fake with `autoCompleteStart: false` plus
+`session.completeStart()`, `session.fail(error)` for device loss, and the
+mutable `connector.connectError`. These controls are fake-only and are not part
+of `VoiceConnector` or `VoiceSession`. See `example/fake_voice_connector.dart`
+for host code that consumes it.
+
+## License
+
 Licensed under Apache-2.0. See the repository root for the license text.
