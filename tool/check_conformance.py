@@ -255,6 +255,45 @@ def validate_manifest(manifest: Any) -> list[dict[str, Any]]:
     return fixture_sets
 
 
+def validate_connector_manifest(connector: Any, location: str, protocol_major: int) -> None:
+    """Check the rules of spec/connector-manifest.schema.json that matter for review, without a schema library."""
+    assert isinstance(connector, dict), f"{location}: manifest must be an object"
+    schema = json.loads((ROOT / "spec/connector-manifest.schema.json").read_text(encoding="utf-8"))
+    allowed = set(schema["properties"])
+    missing = set(schema["required"]) - set(connector)
+    assert not missing, f"{location}: missing {sorted(missing)}"
+    unknown = set(connector) - allowed
+    assert not unknown, f"{location}: unknown fields {sorted(unknown)}"
+    assert re.fullmatch(schema["properties"]["id"]["pattern"], connector["id"]), f"{location}: invalid id"
+    assert re.fullmatch(schema["properties"]["version"]["pattern"], connector["version"]), f"{location}: invalid version"
+    assert connector["status"] in schema["properties"]["status"]["enum"], f"{location}: invalid status"
+    assert connector["protocolMajor"] == protocol_major, f"{location}: protocol major mismatch"
+    for field in ("transports", "capabilities", "platforms"):
+        values = connector[field]
+        assert isinstance(values, list) and all(isinstance(value, str) for value in values), (
+            f"{location}: {field} must be a list of strings"
+        )
+        assert len(values) == len(set(values)), f"{location}: duplicate {field}"
+    implementation = connector["implementation"]
+    assert isinstance(implementation, dict) and set(implementation) == {"language", "sdk", "path"}, (
+        f"{location}: implementation needs exactly language, sdk and path"
+    )
+    assert (ROOT / implementation["path"]).is_dir(), f"{location}: implementation path missing"
+    licenses = connector["licenses"]
+    assert isinstance(licenses, dict) and licenses and all(
+        isinstance(value, str) and value for value in licenses.values()
+    ), f"{location}: licenses must name at least one license"
+
+
+def validate_connector_manifests(protocol_major: int) -> int:
+    paths = sorted((ROOT / "connectors").rglob("connector.json"))
+    assert paths, "no connector manifests found"
+    for path in paths:
+        location = str(path.relative_to(ROOT))
+        validate_connector_manifest(json.loads(path.read_text(encoding="utf-8")), location, protocol_major)
+    return len(paths)
+
+
 def main() -> None:
     manifest = json.loads((ROOT / "conformance/manifest.json").read_text(encoding="utf-8"))
     fixture_sets = validate_manifest(manifest)
@@ -311,13 +350,11 @@ def main() -> None:
             assert parts[-1] not in KNOWN_FIELDS.get(owner, set()), (
                 f"{unknown_path} is a known field in {fixture_set['name']}"
             )
-    connector = json.loads((ROOT / "connectors/omi/connector.json").read_text(encoding="utf-8"))
-    assert connector["protocolMajor"] == protocol["major"], "connector protocol major mismatch"
-    assert (ROOT / connector["implementation"]["path"]).is_dir(), "connector implementation path missing"
+    connectors = validate_connector_manifests(protocol["major"])
     total_lines = sum(fixture_set["lines"] for fixture_set in fixture_sets)
     print(
         "Murmur protocol fixtures and connector manifests are consistent "
-        f"({len(fixture_sets)} sets, {total_lines} lines)."
+        f"({len(fixture_sets)} sets, {total_lines} lines, {connectors} connectors)."
     )
 
 
